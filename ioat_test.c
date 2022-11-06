@@ -14,7 +14,7 @@
 #include <asm/cpufeature.h>
 
 //#define CACHE_SIZE (36608 << 12)
-#define CACHE_SIZE (4096 << 12)
+#define CACHE_SIZE (8192 << 12)
 
 // perf counters stuff
 #define IA32_PERF_GLOBAL_CTRL_ENABLE 0x70000000f
@@ -88,41 +88,17 @@ void ioat_cp(u64 dma_src, u64 dma_dst, int len) {
 	} 
 }
 
-void test_memcpy(int src_num_pages) {
+void test_memcpy(char** src, char* dst, int src_num_pages) {
     int i;
-    char* dst;
-    char** src;
-
-    src = kmalloc(src_num_pages * sizeof(char*), GFP_KERNEL);
-    dst = kmalloc(PAGE_SIZE, GFP_KERNEL);
-
-    for (i = 0; i < src_num_pages; i++) {
-        src[i] = kmalloc(PAGE_SIZE, GFP_KERNEL);
-        if (src[i] == NULL) {
-            pr_err("test_memcpy src alloc failed, at %d\n", i);
-            src_num_pages = i;
-            goto out;
-        }
-    }
-
     for (i = 0; i < src_num_pages; i++) {
         memcpy(dst, src[i], PAGE_SIZE);
     }
     pr_info("test_memcpy, done copy %ldMB to dst\n", (src_num_pages * PAGE_SIZE) >> 20);
-
-out:
-    for (i = 0; i < src_num_pages; i++) {
-        kfree(src[i]);
-    }
-    kfree(src);
-    kfree(dst);
 }
 
 // assume init_ioat is called
-void test_ioat_cp(int src_num_pages) {
+void test_ioat_cp(char** src, char* dst, int src_num_pages) {
     int i;
-    char* dst;
-    char** src;
     u64 dma_dst;
     u64* dma_src;
     enum dma_ctrl_flags flags;
@@ -134,20 +110,11 @@ void test_ioat_cp(int src_num_pages) {
 
     init_completion(&comp);
     
-    dst = kmalloc(PAGE_SIZE, GFP_KERNEL);
     dma_src = kmalloc(src_num_pages * sizeof(u64), GFP_KERNEL);
-    src = kmalloc(src_num_pages * sizeof(char*), GFP_KERNEL);
-
     dma_dst = dma_map_single(ioat_device->dev, dst, PAGE_SIZE, DMA_BIDIRECTIONAL); 
     flags = 0;
 
     for (i = 0; i < src_num_pages; i++) {
-        src[i] = kmalloc(PAGE_SIZE, GFP_KERNEL);
-        if (src[i] == NULL) {
-            pr_err("test_ioat_cp src alloc failed, at %d\n", i);
-            src_num_pages = i;
-            goto out;
-        }
         dma_src[i] = dma_map_single(ioat_device->dev, src[i], PAGE_SIZE, DMA_BIDIRECTIONAL);
     }
 
@@ -180,15 +147,10 @@ void test_ioat_cp(int src_num_pages) {
         pr_info("test_ioat_cp, done copy %ldMB to dst\n", (src_num_pages * PAGE_SIZE) >> 20);
 	} 
 
-out:
     for (i = 0; i < src_num_pages; i++) {
-        kfree(src[i]);
         dma_unmap_single(ioat_device->dev, dma_src[i], PAGE_SIZE, DMA_BIDIRECTIONAL);
     }
     dma_unmap_single(ioat_device->dev, dma_dst, PAGE_SIZE, DMA_BIDIRECTIONAL);
-    
-    kfree(src);
-    kfree(dst);
     kfree(dma_src);
 }
 
@@ -261,7 +223,9 @@ void modify_buf(char** buf, int num_pages, u64* cycle, u64* cache) {
 static int ioat_test_init(void){
     char** cache_size_buf;
     char* curr_buf;
-    int cache_num_pages, i;
+    char** test_src;
+    char* test_dst;
+    int cache_num_pages, src_num_pages, i;
     u64 t1, t2, c1, c2;
     u64 cycle_pre_test, cache_pre_test, cycle_post_test, cache_post_test;
 
@@ -269,42 +233,56 @@ static int ioat_test_init(void){
 	chan = NULL; // avoid accidentially release a void chan
 	init_ioat();
 
+    // init, allocate stuff
     cache_num_pages = CACHE_SIZE >> 12;
-    cache_size_buf = kmalloc(cache_num_pages * sizeof(char*), GFP_KERNEL);
+    src_num_pages = 2 << 14;
 
+    // array and dst allocate
+    cache_size_buf = kmalloc(cache_num_pages * sizeof(char*), GFP_KERNEL);
+    test_src = kmalloc(src_num_pages * sizeof(char*), GFP_KERNEL);
+    test_dst = kmalloc(PAGE_SIZE, GFP_KERNEL);
+
+    // allocate for cache buffer
     for (i = 0; i < cache_num_pages; i++) {
         curr_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
         if (curr_buf == NULL) {
             pr_err("curr_buf alloc failed\n");
+
+            // avoid freeing extra pages
             cache_num_pages = i;
+            src_num_pages = 0;
             goto out;
         }
         cache_size_buf[i] = curr_buf;
     }
+
+    // allocate for test src
+    for (i = 0; i < src_num_pages; i++) {
+        test_src[i] = kmalloc(PAGE_SIZE, GFP_KERNEL);
+        if (test_src[i] == NULL) {
+            pr_err("test_src alloc failed, at %d\n", i);
+
+            // avoid freeing extra pages
+            src_num_pages = i;
+            goto out;
+        }
+    }
     pr_info("alloc all ok, num_pages: %d, total_size: %dMB\n", cache_num_pages, CACHE_SIZE >> 20);
 
+    // make sure buffer is in the cache, being most recently used
     modify_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+    for (i = 0; i < 8; i++) {
+        touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+    }
 
-    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
-    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
-    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
-    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
-    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
-    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
-    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
-    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
-
+    // evict with ioat or memcpy
     c1 = fetch_perf_counters();
     t1 = rdtsc();
 
-    /*
-    test_memcpy((2 << 14));
-    test_memcpy((2 << 14));
-    test_memcpy((2 << 14));
-    */
-    test_ioat_cp(2 << 14);
-    test_ioat_cp(2 << 14);
-    test_ioat_cp(2 << 14);
+    for (i = 0; i < 8; i++) {
+        //test_ioat_cp(test_src, test_dst, src_num_pages);
+        test_memcpy(test_src, test_dst, src_num_pages);
+    }
 
     t2 = rdtsc();
     c2 = fetch_perf_counters();
@@ -312,17 +290,26 @@ static int ioat_test_init(void){
     pr_info("[test_*] cycles = %llu\n", t2 - t1);
     pr_info("[test_*] cache miss = %llu\n", c2 - c1);
 
+    // touch the cache buffer again and see how much of it is being evicted
     touch_buf(cache_size_buf, cache_num_pages, &cycle_post_test, &cache_post_test);
-
+    pr_info("buf A size: %dMB, buf B size; %ldMB\n", 
+            CACHE_SIZE >> 20, (src_num_pages * PAGE_SIZE) >> 20);
     pr_info("Diff last cycle      = %lld\n", (int64_t)cycle_post_test - (int64_t)cycle_pre_test);
     pr_info("Diff last cache miss = %lld\n", (int64_t)cache_post_test - (int64_t)cache_pre_test);
 
     
+    // clean up
 out:
     for (i = 0; i < cache_num_pages; i++) {
         kfree(cache_size_buf[i]);
     }
     kfree(cache_size_buf);
+
+    for (i = 0; i < src_num_pages; i++) {
+        kfree(test_src[i]);
+    }
+    kfree(test_src);
+    kfree(test_dst);
 	return 0;
 }
     
