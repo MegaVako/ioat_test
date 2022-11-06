@@ -7,3 +7,4 @@ dmesg -D
 make clean
 dmesg -E
 rmmod ioat_test 
+dmesg

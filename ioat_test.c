@@ -13,7 +13,8 @@
 #include <asm/set_memory.h>
 #include <asm/cpufeature.h>
 
-#define CACHE_SIZE (36608 << 12)
+//#define CACHE_SIZE (36608 << 12)
+#define CACHE_SIZE (4096 << 12)
 
 // perf counters stuff
 #define IA32_PERF_GLOBAL_CTRL_ENABLE 0x70000000f
@@ -29,6 +30,28 @@ struct dma_device *ioat_device = NULL;
 void callback(void *param) {
     struct completion *cmp = param;
 	complete(cmp);
+}
+
+void init_perf_counters(void) {
+    int cpu;
+    wrmsrl(MSR_CORE_PERF_FIXED_CTR_CTRL, IA32_PERF_FIXED_CTRL_ENABLE);
+    wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, IA32_PERF_GLOBAL_CTRL_ENABLE);
+    for_each_possible_cpu(cpu) {
+        wrmsrl_on_cpu(cpu, MSR_P6_EVNTSEL0, LLC_EVENT);
+    }
+}
+
+u64 fetch_perf_counters(void) {
+    int cpu;
+    u64 val, curr_val;
+    val = 0;
+    for_each_possible_cpu(cpu) {
+        rdmsrl_on_cpu(cpu, MSR_IA32_PERFCTR0, &curr_val);
+        val += curr_val;
+        //printk(KERN_DEBUG "The LLC-Miss on core %i is: %llu\n", cpu, val);
+    }
+    //printk(KERN_DEBUG "The LLC-Miss on all core is: %llu\n", val);
+    return val;
 }
 
 void ioat_cp(u64 dma_src, u64 dma_dst, int len) {
@@ -85,7 +108,7 @@ void test_memcpy(int src_num_pages) {
     for (i = 0; i < src_num_pages; i++) {
         memcpy(dst, src[i], PAGE_SIZE);
     }
-    pr_info("test_memcpy, done copy %d pages to dst\n", src_num_pages);
+    pr_info("test_memcpy, done copy %ldMB to dst\n", (src_num_pages * PAGE_SIZE) >> 20);
 
 out:
     for (i = 0; i < src_num_pages; i++) {
@@ -154,7 +177,7 @@ void test_ioat_cp(int src_num_pages) {
 		printk(KERN_INFO "DMA returned completion status of: %s\n",
             status == DMA_ERROR ? "error" : "in progress");
 	} else {
-        pr_info("test_ioat_cp, done copy %d pages to dst\n", src_num_pages);
+        pr_info("test_ioat_cp, done copy %ldMB to dst\n", (src_num_pages * PAGE_SIZE) >> 20);
 	} 
 
 out:
@@ -190,49 +213,48 @@ static int init_ioat(void) {
 	return 0;
 }
 
-void init_perf_counters(void) {
-    int cpu;
-    wrmsrl(MSR_CORE_PERF_FIXED_CTR_CTRL, IA32_PERF_FIXED_CTRL_ENABLE);
-    wrmsrl(MSR_CORE_PERF_GLOBAL_CTRL, IA32_PERF_GLOBAL_CTRL_ENABLE);
-    for_each_possible_cpu(cpu) {
-        wrmsrl_on_cpu(cpu, MSR_P6_EVNTSEL0, LLC_EVENT);
-    }
-}
-
-u64 fetch_perf_counters(void) {
-    int cpu;
-    u64 val, curr_val;
-    val = 0;
-    for_each_possible_cpu(cpu) {
-        rdmsrl_on_cpu(cpu, MSR_IA32_PERFCTR0, &curr_val);
-        val += curr_val;
-        //printk(KERN_DEBUG "The LLC-Miss on core %i is: %llu\n", cpu, val);
-    }
-    //printk(KERN_DEBUG "The LLC-Miss on all core is: %llu\n", val);
-    return val;
-}
 
 // len in byte
-void touch_buf(char** buf, int num_pages) {
+void touch_buf(char** buf, int num_pages, u64* cycle, u64* cache) {
     int i, j;
     char dummy;
+    u64 t1, t2, c1, c2;
+    c1 = fetch_perf_counters();
+    t1 = rdtsc();
     for (j = 0; j < num_pages; j++) {
         for (i = 0; i < PAGE_SIZE; i++) {
             dummy = buf[j][i];
             dummy += 1;
         }
     }
-    pr_info("touched: %d pages\n", num_pages);
+    t2 = rdtsc();
+    c2 = fetch_perf_counters();
+    *cycle = t2 - t1;
+    *cache = c2 - c1;
+    pr_info("=============\n");
+    pr_info("[touch_buf] touch: %d pages\n", num_pages);
+    pr_info("[touch_buf] touch cycles = %llu\n", *cycle);
+    pr_info("[touch_buf] touch cache miss = %llu\n", *cache);
 }
 
-void modify_buf(char** buf, int num_pages) {
+void modify_buf(char** buf, int num_pages, u64* cycle, u64* cache) {
     int i, j;
+    u64 t1, t2, c1, c2;
+    c1 = fetch_perf_counters();
+    t1 = rdtsc();
     for (j = 0; j < num_pages; j++) {
         for (i = 0; i < PAGE_SIZE; i++) {
             buf[j][i] += 1;
         }
     }
-    pr_info("modify: %d pages\n", num_pages);
+    t2 = rdtsc();
+    c2 = fetch_perf_counters();
+    *cycle = t2 - t1;
+    *cache = c2 - c1;
+    pr_info("=============\n");
+    pr_info("[modify_buf] modify: %d pages\n", num_pages);
+    pr_info("[modify_buf] modify cycles = %llu\n", *cycle);
+    pr_info("[modify_buf] modify cache miss = %llu\n", *cache);
 }
 
 
@@ -241,6 +263,7 @@ static int ioat_test_init(void){
     char* curr_buf;
     int cache_num_pages, i;
     u64 t1, t2, c1, c2;
+    u64 cycle_pre_test, cache_pre_test, cycle_post_test, cache_post_test;
 
 	pr_info("ioat test init!\n");
 	chan = NULL; // avoid accidentially release a void chan
@@ -254,37 +277,48 @@ static int ioat_test_init(void){
         if (curr_buf == NULL) {
             pr_err("curr_buf alloc failed\n");
             cache_num_pages = i;
-            break;
+            goto out;
         }
         cache_size_buf[i] = curr_buf;
     }
     pr_info("alloc all ok, num_pages: %d, total_size: %dMB\n", cache_num_pages, CACHE_SIZE >> 20);
 
-    modify_buf(cache_size_buf, cache_num_pages);
+    modify_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+
+    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
+    touch_buf(cache_size_buf, cache_num_pages, &cycle_pre_test, &cache_pre_test);
 
     c1 = fetch_perf_counters();
     t1 = rdtsc();
 
-    touch_buf(cache_size_buf, cache_num_pages);
+    /*
+    test_memcpy((2 << 14));
+    test_memcpy((2 << 14));
+    test_memcpy((2 << 14));
+    */
+    test_ioat_cp(2 << 14);
+    test_ioat_cp(2 << 14);
+    test_ioat_cp(2 << 14);
 
     t2 = rdtsc();
-    pr_info("touch 1 cycles = %llu\n", t2 - t1);
     c2 = fetch_perf_counters();
-    pr_info("touch 1 cache miss = %llu\n", c2 - c1);
+    pr_info("=============\n");
+    pr_info("[test_*] cycles = %llu\n", t2 - t1);
+    pr_info("[test_*] cache miss = %llu\n", c2 - c1);
 
-    //test_memcpy(cache_num_pages / 2);
-    test_ioat_cp(cache_num_pages / 2);
+    touch_buf(cache_size_buf, cache_num_pages, &cycle_post_test, &cache_post_test);
 
-    init_perf_counters();
-    c1 = fetch_perf_counters();
-    t1 = rdtsc();
-    touch_buf(cache_size_buf, cache_num_pages);
-    t2 = rdtsc();
-    pr_info("touch 2 cycles = %llu\n", t2 - t1);
-    c2 = fetch_perf_counters();
-    pr_info("touch 2 cache miss = %llu\n", c2 - c1);
+    pr_info("Diff last cycle      = %lld\n", (int64_t)cycle_post_test - (int64_t)cycle_pre_test);
+    pr_info("Diff last cache miss = %lld\n", (int64_t)cache_post_test - (int64_t)cache_pre_test);
 
     
+out:
     for (i = 0; i < cache_num_pages; i++) {
         kfree(cache_size_buf[i]);
     }
