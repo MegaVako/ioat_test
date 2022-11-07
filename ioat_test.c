@@ -232,6 +232,7 @@ static int ioat_test_init(void){
 	pr_info("ioat test init!\n");
 	chan = NULL; // avoid accidentially release a void chan
 	init_ioat();
+    init_perf_counters();
 
     // init, allocate stuff
     cache_num_pages = CACHE_SIZE >> 12;
@@ -279,10 +280,11 @@ static int ioat_test_init(void){
     c1 = fetch_perf_counters();
     t1 = rdtsc();
 
+    /*
     for (i = 0; i < 8; i++) {
         //test_ioat_cp(test_src, test_dst, src_num_pages);
-        test_memcpy(test_src, test_dst, src_num_pages);
-    }
+        //test_memcpy(test_src, test_dst, src_num_pages);
+    }*/
 
     t2 = rdtsc();
     c2 = fetch_perf_counters();
